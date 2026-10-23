@@ -25201,6 +25201,19 @@ pub const Transformer = struct {
         if (enable_mtp) self.qwen4MtpReset() catch {};
     }
 
+    /// Reset only the head state `st` owns, wherever it lives: on the module when `st` is the
+    /// active owner, else in `st` itself. Another request's state (e.g. an outer prefill whose
+    /// chunk boundary admitted this one) is never touched, so it is safe at a boundary.
+    pub fn qwen4MtpResetState(self: *Transformer, st: *Qwen4MtpState) !void {
+        if (self.qwen4_mtp == null) return;
+        if (self.qwen4_mtp_owner == st) return self.qwen4MtpReset();
+        try st.cache.reinit(self.config.num_hidden_layers + 1, st.cache.config);
+        ssmFreeQsaState(&st.entry);
+        st.qsa_marks.deinit();
+        st.seq_offset = 0;
+        st.pos_base = -1;
+    }
+
     /// `--mtp-head-kv-quant` opts the qwen4 MTP head's KV into `--kv-quant`; the default
     /// stays dense bf16 (the head is a lossy draft and short prompts dequantize under the
     /// fused-kernel floor). Set once at parse; the override is a test seam.
@@ -25229,6 +25242,55 @@ pub const Transformer = struct {
         const n_layers: u32 = self.config.num_hidden_layers + 1;
         if (std.meta.eql(m.cache.config, cfg) and m.cache.entries.len == n_layers) return;
         try m.cache.reinit(n_layers, cfg);
+    }
+
+    test "qwen4MtpResetState: a boundary slot's reset clears only its own state, never the active owner's" {
+        // A owns the module and B resets: only B clears. Then B owns it and resets: A is kept.
+        if (mlx.noGpuBackend()) return error.SkipZigTest;
+        const t = std.testing;
+        var xfm: Transformer = undefined;
+        xfm.rht = null;
+        xfm.s = mlx.gpuStream();
+        xfm.allocator = t.allocator;
+        xfm.qwen4_mtp_owner = null;
+        xfm.config.num_hidden_layers = 0;
+        const head_cache = try KVCache.init(t.allocator, 1);
+        var head: Qwen4Mtp = undefined;
+        head.cache = head_cache;
+        head.entry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        head.qsa_marks = .{};
+        head.seq_offset = 0;
+        head.pos_base = 0;
+        xfm.qwen4_mtp = head;
+        const m = &xfm.qwen4_mtp.?;
+        defer m.cache.deinit();
+
+        const ca = try KVCache.init(t.allocator, 1);
+        var a: Transformer.Qwen4MtpState = .{ .cache = ca, .entry = m.entry };
+        defer a.deinit();
+        const cb = try KVCache.init(t.allocator, 1);
+        var b: Transformer.Qwen4MtpState = .{ .cache = cb, .entry = m.entry };
+        defer b.deinit();
+
+        xfm.qwen4MtpActivate(&a);
+        m.seq_offset = 40;
+        m.pos_base = 5;
+        b.seq_offset = 9;
+        b.pos_base = 2;
+        try xfm.qwen4MtpResetState(&b);
+        try t.expect(xfm.qwen4_mtp_owner == &a);
+        try t.expectEqual(@as(usize, 40), m.seq_offset);
+        try t.expectEqual(@as(c_int, 5), m.pos_base);
+        try t.expectEqual(@as(usize, 0), b.seq_offset);
+        try t.expectEqual(@as(c_int, -1), b.pos_base);
+
+        b.seq_offset = 3;
+        xfm.qwen4MtpActivate(&b);
+        try xfm.qwen4MtpResetState(&b);
+        try t.expectEqual(@as(usize, 0), m.seq_offset);
+        try t.expectEqual(@as(c_int, -1), m.pos_base);
+        try t.expectEqual(@as(usize, 40), a.seq_offset);
+        try t.expectEqual(@as(c_int, 5), a.pos_base);
     }
 
     test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {

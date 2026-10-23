@@ -2810,6 +2810,33 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     return true;
 }
 
+test "qwen4HeadResetFor: a slot resets only its own head state; a stateless boundary slot touches nothing" {
+    try testing.expectEqual(Qwen4HeadReset.none, qwen4HeadResetFor(false, false, false));
+    try testing.expectEqual(Qwen4HeadReset.none, qwen4HeadResetFor(false, true, true));
+    try testing.expectEqual(Qwen4HeadReset.own_state, qwen4HeadResetFor(true, true, false));
+    try testing.expectEqual(Qwen4HeadReset.own_state, qwen4HeadResetFor(true, true, true));
+    // Boundary admission on: a slot with no state of its own leaves the module (the outer's head) alone.
+    try testing.expectEqual(Qwen4HeadReset.none, qwen4HeadResetFor(true, false, true));
+    // Off: the shipped behavior (module reset) is unchanged.
+    try testing.expectEqual(Qwen4HeadReset.module, qwen4HeadResetFor(true, false, false));
+}
+
+test "boundaryQwen4Enabled: off by default, and a qwen4 candidate is module_state only while off" {
+    boundary_qwen4_override = null;
+    defer boundary_qwen4_override = null;
+    const raw = std.c.getenv("MLX_SERVE_BOUNDARY_QWEN4");
+    if (raw == null) try testing.expect(!boundaryQwen4Enabled());
+    const ctx: BoundaryCtx = .{ .share = 0.25, .nested = false, .outer_exclusive = false, .decoding = 1, .max_concurrent = 4, .max_tail = BOUNDARY_MAX_TAIL };
+    var c: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = 64 };
+    boundary_qwen4_override = false;
+    c.module_state = boundaryModuleState(true);
+    try testing.expect(!boundaryEligible(c, ctx));
+    try testing.expect(!boundaryModuleState(false));
+    boundary_qwen4_override = true;
+    c.module_state = boundaryModuleState(true);
+    try testing.expect(boundaryEligible(c, ctx));
+}
+
 test "boundaryEligible: a small plain request is admitted only under a share, never nested, never beside an exclusive model" {
     const base_cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = 31 };
     const base_ctx: BoundaryCtx = .{ .share = 0.5, .nested = false, .outer_exclusive = false, .decoding = 2, .max_concurrent = 8, .max_tail = BOUNDARY_MAX_TAIL };
@@ -7920,6 +7947,26 @@ pub const BoundaryCtx = struct {
     max_tail: usize,
 };
 
+/// `MLX_SERVE_BOUNDARY_QWEN4=1` admits qwen4_exp requests at a chunk boundary too (default off).
+/// Safe because a declined restore resets only the admitted slot's own MTP head state
+/// (`resetSlotQwen4Head`), never the outer prefill's.
+pub var boundary_qwen4_override: ?bool = null;
+var boundary_qwen4_cached: ?bool = null;
+pub fn boundaryQwen4Enabled() bool {
+    if (boundary_qwen4_override) |v| return v;
+    if (boundary_qwen4_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_BOUNDARY_QWEN4");
+    const on = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    boundary_qwen4_cached = on;
+    return on;
+}
+
+/// The candidate's `module_state` bit: a qwen4_exp request is held back from a boundary unless
+/// `MLX_SERVE_BOUNDARY_QWEN4` is on.
+pub fn boundaryModuleState(is_qwen4: bool) bool {
+    return is_qwen4 and !boundaryQwen4Enabled();
+}
+
 /// May this pending request be prefilled at the outer prefill's chunk boundary?
 pub fn boundaryEligible(c: BoundaryCand, x: BoundaryCtx) bool {
     if (x.share <= 0 or x.nested or x.outer_exclusive) return false;
@@ -7970,10 +8017,36 @@ fn emptySlotCache(slot: *Slot) void {
     if (slot.model.transformer) |xf| {
         slot.cache.truncate(0, xf.s) catch {};
         xf.resetQsaPooledRope();
-        xf.qwen4MtpResetOwned(slot.enable_mtp);
+        resetSlotQwen4Head(slot, xf);
     }
     slot.moe_seq_offset = 0;
     slot.cached_tokens = 0;
+}
+
+/// A slot resets only its own qwen4 MTP head state. With no state yet it leaves the module
+/// alone, so a declined restore at a chunk boundary keeps the outer request's head.
+pub const Qwen4HeadReset = enum { none, own_state, module };
+
+pub fn qwen4HeadResetFor(enable_mtp: bool, has_own_state: bool, boundary_safe: bool) Qwen4HeadReset {
+    if (!enable_mtp) return .none;
+    if (has_own_state) return .own_state;
+    return if (boundary_safe) .none else .module;
+}
+
+fn resetSlotQwen4Head(slot: *Slot, xf: *transformer_mod.Transformer) void {
+    const own: ?*transformer_mod.Transformer.Qwen4MtpState = blk: {
+        const g = if (slot.legacy_gen) |*gen| gen else break :blk null;
+        const mc = if (g.mtp_cache) |*m| m else break :blk null;
+        break :blk switch (mc.*) {
+            .qwen4 => |r| r.st,
+            else => null,
+        };
+    };
+    switch (qwen4HeadResetFor(slot.enable_mtp, own != null, boundaryQwen4Enabled())) {
+        .none => {},
+        .own_state => xf.qwen4MtpResetState(own.?) catch {},
+        .module => xf.qwen4MtpResetOwned(true),
+    }
 }
 
 /// The first pending request that passes the boundary gate, removed from `pending` with its
@@ -8002,7 +8075,7 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .has_media = s.vision_embeddings != null or s.media.len > 0,
             .prompt_logprobs = s.prompt_logprobs,
             .generator_path = s.model.transformer != null and s.model.ds4_engine == null and s.model.llama_engine == null,
-            .module_state = if (s.model.transformer) |xf| xf.config.isQwen4() else false,
+            .module_state = boundaryModuleState(if (s.model.transformer) |xf| xf.config.isQwen4() else false),
             .tail = slotUncachedTail(s),
         };
         if (!boundaryEligible(c, x)) continue;
