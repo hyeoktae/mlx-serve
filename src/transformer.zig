@@ -43739,6 +43739,11 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
                 return;
             }
         };
+        if (sorted) if (try gatherQmmF16(x, w, sc, bi, lhs_idx, rhs_idx, bits, group_size, mode, s)) |out| {
+            _ = mlx.mlx_array_free(res.*);
+            res.* = out;
+            return;
+        };
         try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
     }
 }
@@ -45097,6 +45102,7 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     if (rows < prefillDqGemmRowFloorNow(bits, n, @intCast(last))) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
+    if (xd == .bfloat16 and f16PrefillEnabled()) return try prefillDqGemmF16(x, w, sc, bi, bits, group_size, mode, s);
 
     var dq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dq);
@@ -45108,6 +45114,63 @@ fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
     prefill_dq_gemm_engaged += 1;
+    return out;
+}
+
+// ── FP16 prefill GEMMs for bf16 models (opt-in: MLX_SERVE_F16_PREFILL=1) ──
+// GPUs without native bf16 (M1 family) run steel GEMM ~24% and gather_qmm ~19% faster in
+// fp16 (M1 Ultra µbench, Flash-Next shapes). The routed prefill GEMMs cast the bf16
+// activations and the dequantized weight / quant params to fp16, multiply, and return bf16.
+// Decode and verify widths are untouched (they never reach these routes).
+var f16_prefill_env_cached: ?bool = null;
+
+pub fn f16PrefillEnabled() bool {
+    if (f16_prefill_env_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_F16_PREFILL");
+    const enabled = if (raw) |r| std.mem.eql(u8, std.mem.sliceTo(r, 0), "1") else false;
+    f16_prefill_env_cached = enabled;
+    return enabled;
+}
+
+fn prefillDqGemmF16(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
+    var x16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x16);
+    try mlx.check(mlx.mlx_astype(&x16, x, .float16, s));
+    var dq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq);
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float16, .has_value = true }, s));
+    var dq_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq_t);
+    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+    var out16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out16);
+    try mlx.check(mlx.mlx_matmul(&out16, x16, dq_t, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, out16, .bfloat16, s));
+    prefill_dq_gemm_engaged += 1;
+    return out;
+}
+
+/// Sorted (prefill) affine gather_qmm in fp16 for a bf16 activation; null when it does not apply.
+fn gatherQmmF16(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!f16PrefillEnabled() or mode != .affine or bi.ctx == null) return null;
+    if (mlx.mlx_array_dtype(x) != .bfloat16) return null;
+    var x16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x16);
+    try mlx.check(mlx.mlx_astype(&x16, x, .float16, s));
+    var sc16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc16);
+    try mlx.check(mlx.mlx_astype(&sc16, sc, .float16, s));
+    var bi16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi16);
+    try mlx.check(mlx.mlx_astype(&bi16, bi, .float16, s));
+    var out16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out16);
+    try mlx.check(mlx.mlx_gather_qmm(&out16, x16, w, sc16, bi16, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), true, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, out16, .bfloat16, s));
     return out;
 }
 
